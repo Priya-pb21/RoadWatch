@@ -1,0 +1,1137 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  AlertTriangle,
+  BarChart3,
+  Camera,
+  ClipboardList,
+  Download,
+  FileText,
+  Home,
+  Loader2,
+  MapPin,
+  Search,
+  ShieldCheck,
+  SlidersHorizontal,
+  Upload,
+  Users,
+  X,
+} from "lucide-react";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Legend,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { CircleMarker, MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
+import "./App.css";
+import AppLayout from "./components/layout/AppLayout";
+import FilterBar from "./components/FilterBar";
+import AuthPage from "./pages/AuthPage";
+import { AccessDenied, DataTable, EmptyState, LoadingState, Panel, StatCard as MetricCard, StatusBadge } from "./components/ui";
+
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
+const USER_NAVIGATION = [
+  ["Overview", Home, "/user/dashboard", "Overview Dashboard"],
+  ["Report Pothole", Camera, "/user/report", "Live Detection"],
+  ["My Potholes", ClipboardList, "/user/my-potholes", "Pothole Registry"],
+  ["My Analytics", BarChart3, "/user/analytics", "Analytics"],
+  ["My Map", MapPin, "/user/map", "GIS Map"],
+  ["Severity Analysis", Activity, "/user/severity", "Severity Analysis"],
+  ["Reports & Exports", FileText, "/user/reports", "Reports and Exports"],
+];
+const ADMIN_NAVIGATION = [
+  ["Global Overview", Home, "/admin/dashboard", "Overview Dashboard"],
+  ["User Management", Users, "/admin/users", "User Management"],
+  ["Pothole Management", ClipboardList, "/admin/potholes", "Pothole Registry"],
+  ["Global Analytics", BarChart3, "/admin/analytics", "Analytics"],
+  ["Global Map", MapPin, "/admin/map", "GIS Map"],
+  ["Severity Analysis", Activity, "/admin/severity", "Severity Analysis"],
+  ["Reports & Exports", FileText, "/admin/reports", "Reports and Exports"],
+];
+const PAGE_DESCRIPTIONS = {
+  "Overview Dashboard": "A clear view of road conditions and detection activity.",
+  "Live Detection": "Capture road conditions with image, video, or live camera detection.",
+  "Pothole Registry": "Review recorded potholes and confirmed detection events.",
+  Analytics: "Explore detection trends and road condition patterns.",
+  "GIS Map": "Inspect pothole records with verified GPS coordinates.",
+  "Severity Analysis": "Review recorded potholes by severity and trend.",
+  "Reports and Exports": "Filter and export records from your available data.",
+  "User Management": "Review account access and registered user activity.",
+};
+const SEVERITY_COLORS = { low: "#16a34a", medium: "#d97706", high: "#dc2626", critical: "#7f1d1d" };
+const REFRESH_SECONDS = 5;
+const PAGE_SIZE = 25;
+function getApiErrorMessage(payload, status, fallback = "Something went wrong.") {
+  const detail = payload?.detail;
+
+  if (typeof detail === "string") {
+    return detail;
+  }
+
+  if (detail && typeof detail === "object") {
+    const messages = [];
+
+    if (detail.message) messages.push(detail.message);
+    if (detail.reason) messages.push(detail.reason);
+
+    if (detail.predicted_scene) {
+      messages.push(`Detected scene: ${detail.predicted_scene}`);
+    }
+
+    if (detail.error) messages.push(detail.error);
+
+    if (messages.length) {
+      return messages.join(" · ");
+    }
+
+    return JSON.stringify(detail);
+  }
+
+  if (payload?.message) return payload.message;
+
+  return `${fallback} (HTTP ${status})`;
+}
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  return fetch(url, { credentials: "include", ...options, headers });
+}
+
+function formatPercent(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "N/A";
+  const number = Number(value);
+  return `${number > 1 ? number.toFixed(1) : (number * 100).toFixed(1)}%`;
+}
+
+function formatConfidence(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "N/A";
+  const number = Number(value);
+  return `${(number > 1 ? number : number * 100).toFixed(2)}%`;
+}
+
+function formatDate(value) {
+  if (!value) return "Unavailable";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function validCoordinate(record) {
+  if (record.latitude === null || record.latitude === undefined || record.longitude === null || record.longitude === undefined) return false;
+  if (typeof record.latitude === "string" && !record.latitude.trim()) return false;
+  if (typeof record.longitude === "string" && !record.longitude.trim()) return false;
+  const lat = Number(record.latitude);
+  const lon = Number(record.longitude);
+  return Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+}
+
+function recordKey(record) {
+  return record._id ?? record.pothole_id;
+}
+
+function locationLabel(record) {
+  const location = record.location;
+  if (typeof location === "string") return location;
+  if (location && typeof location === "object") {
+    if (location.name || location.address) return location.name || location.address;
+    if (Array.isArray(location.coordinates) && location.coordinates.length >= 2) return `${location.coordinates[1]}, ${location.coordinates[0]}`;
+  }
+  return record.location_name || record.address || record.road_name || "—";
+}
+
+function hasReliableMapAccuracy(record, threshold = 100) {
+  if (record.location_verification_method === "MANUAL" && validCoordinate(record)) return true;
+  if (record.gps_accuracy_m == null) return false;
+  if (typeof record.gps_accuracy_m === "string" && !record.gps_accuracy_m.trim()) return false;
+  const accuracy = Number(record.gps_accuracy_m);
+  return Number.isFinite(accuracy) && accuracy >= 0 && accuracy <= threshold;
+}
+
+function useRoadwatchData(filters, page, includeMap) {
+  const [state, setState] = useState({
+    potholes: [],
+    total: 0,
+    detectionEvents: [],
+    detectionEventTotal: 0,
+    mapRecords: [],
+    mapCount: 0,
+    mapTruncated: false,
+    summary: null,
+    trends: [],
+    monthlyTrends: [],
+    loading: true,
+    refreshing: false,
+    error: "",
+    lastSync: null,
+    stale: true,
+  });
+  const abortRef = useRef(null);
+  const requestIdRef = useRef(0);
+
+  const refresh = useCallback(async ({ silent = false, forceMap = false } = {}) => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const requestId = ++requestIdRef.current;
+    setState((previous) => ({ ...previous, loading: !silent && !previous.lastSync, refreshing: true }));
+    try {
+      const params = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE) });
+      if (filters.search) params.set("search", filters.search);
+      if (filters.severity !== "all") params.set("severity", filters.severity);
+      if (filters.verification !== "all") params.set("verification_status", filters.verification);
+
+      const mapParams = new URLSearchParams();
+      if (filters.search) mapParams.set("search", filters.search);
+      if (filters.severity !== "all") mapParams.set("severity", filters.severity);
+      if (filters.verification !== "all") mapParams.set("verification_status", filters.verification);
+      const [recordsResponse, detectionEventsResponse, summaryResponse, trendsResponse, mapResponse] = await Promise.all([
+        apiFetch(`${API_BASE}/api/potholes?${params}`, { signal: controller.signal }),
+        apiFetch(`${API_BASE}/api/detections?page=1&page_size=50`, { signal: controller.signal }),
+        apiFetch(`${API_BASE}/api/analytics/summary`, { signal: controller.signal }),
+        apiFetch(`${API_BASE}/api/analytics/trends`, { signal: controller.signal }),
+        includeMap || forceMap ? apiFetch(`${API_BASE}/api/potholes/map?${mapParams}`, { signal: controller.signal }) : Promise.resolve(null),
+      ]);
+      for (const [name, response] of [
+        ["Potholes", recordsResponse],
+        ["Detection events", detectionEventsResponse],
+        ["Analytics summary", summaryResponse],
+        ["Analytics trends", trendsResponse],
+        ...(mapResponse ? [["Pothole map", mapResponse]] : []),
+      ]) {
+        if (!response.ok) throw new Error(`${name} API returned ${response.status}`);
+      }
+      const records = await recordsResponse.json();
+      const [detectionEventData, summary, trends, mapData] = await Promise.all([
+        detectionEventsResponse.json(),
+        summaryResponse.json(),
+        trendsResponse.json(),
+        mapResponse ? mapResponse.json() : Promise.resolve(null),
+      ]);
+      if (!Array.isArray(records.potholes)) throw new Error("Invalid /api/potholes response.");
+      if (!Array.isArray(detectionEventData.detections)) throw new Error("Invalid /api/detections response.");
+      if (mapData && !Array.isArray(mapData.records)) throw new Error("Invalid /api/potholes/map response.");
+      if (requestId !== requestIdRef.current) return;
+      setState((previous) => ({
+        ...previous,
+        potholes: records.potholes,
+        total: records.total ?? records.count ?? records.potholes.length,
+        detectionEvents: detectionEventData.detections,
+        detectionEventTotal: detectionEventData.total ?? detectionEventData.detections.length,
+        mapRecords: mapData ? mapData.records : previous.mapRecords,
+        mapCount: mapData ? mapData.count : previous.mapCount,
+        mapTruncated: mapData ? mapData.truncated : previous.mapTruncated,
+        summary,
+        trends: trends.trends || [],
+        monthlyTrends: trends.monthly_trends || [],
+        loading: false,
+        refreshing: false,
+        error: "",
+        lastSync: new Date(),
+        stale: false,
+      }));
+    } catch (error) {
+      if (error.name !== "AbortError" && requestId === requestIdRef.current) {
+        setState((previous) => ({ ...previous, loading: false, refreshing: false, error: error.message || "Backend unavailable", stale: true }));
+      }
+    } finally {
+      if (requestId === requestIdRef.current) {
+        setState((previous) => ({ ...previous, refreshing: false }));
+      }
+    }
+  }, [filters, includeMap, page]);
+
+  useEffect(() => {
+    let timer;
+    let active = true;
+    let initial = true;
+    const poll = async () => {
+      await refresh({ silent: !initial });
+      initial = false;
+      if (active) {
+        timer = window.setTimeout(poll, REFRESH_SECONDS * 1000);
+      }
+    };
+    timer = window.setTimeout(poll, 0);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      abortRef.current?.abort();
+    };
+  }, [refresh]);
+
+  return { ...state, refresh };
+}
+
+function FitMap({ records }) {
+  const map = useMap();
+  const fittedCoordinates = useRef("");
+  useEffect(() => {
+    const points = records.filter(validCoordinate).map((record) => [Number(record.latitude), Number(record.longitude)]);
+    const signature = points.map((point) => point.join(",")).sort().join("|");
+    if (!signature || signature === fittedCoordinates.current) return;
+    fittedCoordinates.current = signature;
+    if (points.length === 1) map.setView(points[0], 15);
+    if (points.length > 1) map.fitBounds(points, { padding: [34, 34], maxZoom: 15 });
+  }, [map, records]);
+  return null;
+}
+
+function MapResizer() {
+  const map = useMap();
+  useEffect(() => {
+    const container = map.getContainer();
+    const resizeObserver = new ResizeObserver(() => map.invalidateSize({ pan: false }));
+    resizeObserver.observe(container);
+    const frame = window.requestAnimationFrame(() => map.invalidateSize({ pan: false }));
+    return () => {
+      window.cancelAnimationFrame(frame);
+      resizeObserver.disconnect();
+    };
+  }, [map]);
+  return null;
+}
+
+function UnverifiedLocationList({ records, events, onVerify }) {
+  const unverifiedRecords = records.filter((record) => record.location_verification_status !== "VERIFIED");
+  const unverifiedEvents = events.filter((event) => (event.location_verification_status || "UNVERIFIED") !== "VERIFIED");
+  if (!unverifiedRecords.length && !unverifiedEvents.length) return null;
+  return (
+    <div className="unverified-list">
+      <h4>Unverified detections and locations</h4>
+      <p>These detections remain saved even when their location is unavailable or too imprecise to map.</p>
+      <div className="unverified-items">
+        {unverifiedEvents.map((event) => (
+          <article key={`event-${event.event_id || event._id}`}>
+            <strong>{event.event_id || event._id || "Detection event"}</strong>
+            <span>{event.source_id || "Source unavailable"} · {formatDate(event.timestamp)}</span>
+            <span>{event.location_verification_reason || "Location is unverified"} · {validCoordinate(event) ? `${Number(event.latitude).toFixed(6)}, ${Number(event.longitude).toFixed(6)}` : "Coordinates unavailable"} · GPS accuracy {event.gps_accuracy_m == null ? "unavailable" : `${Number(event.gps_accuracy_m).toFixed(1)} m`}</span>
+            <span>Confidence: {formatConfidence(event.confidence_percent ?? event.confidence_normalized)}</span>
+            <button onClick={() => onVerify(event)}>Verify Location</button>
+          </article>
+        ))}
+        {unverifiedRecords.map((record) => (
+          <article key={`record-${recordKey(record)}`}>
+            <strong>{record.pothole_id ?? record._id} · {record.record_origin === "historical_unknown" ? "Historical / unknown" : record.source || "Source recorded"}</strong>
+            <span>{validCoordinate(record) ? `${Number(record.latitude).toFixed(6)}, ${Number(record.longitude).toFixed(6)}` : "Coordinates unavailable"} · {record.location_verification_reason || "Location is unverified"} · GPS accuracy {record.gps_accuracy_m == null ? "unavailable" : `${Number(record.gps_accuracy_m).toFixed(1)} m`}</span>
+            <span>Last recorded: {formatDate(record.last_seen_at || record.created_at || record.first_detected_at)}</span>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PotholeMap({ records, events = [], unverifiedRecords = [], selectedId, setSelectedId, refresh = () => {}, accuracyThreshold = 100 }) {
+  const [tileStatus, setTileStatus] = useState("loading");
+  const [selected, setSelected] = useState(null);
+  const coordinateRecords = records.filter(validCoordinate);
+  const valid = coordinateRecords.filter((record) => hasReliableMapAccuracy(record, accuracyThreshold));
+  const markerColor = (record) => (
+    record.record_origin === "historical_unknown"
+      ? "#64748b"
+      : record.location_verification_status === "VERIFIED"
+        ? "#16a34a"
+        : "#d97706"
+  );
+  return (
+    <div className="map-content">
+      {valid.length ? (
+        <div className="map-shell">
+          <MapContainer center={[Number(valid[0].latitude), Number(valid[0].longitude)]} zoom={13} scrollWheelZoom className="leaflet-map">
+            <MapResizer />
+            <TileLayer
+              attribution='&copy; OpenStreetMap contributors'
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              eventHandlers={{
+                tileload: () => setTileStatus("loaded"),
+                tileerror: () => setTileStatus("error"),
+              }}
+            />
+            <FitMap records={valid} />
+            {valid.map((record) => {
+              const id = recordKey(record);
+              const color = markerColor(record);
+              return (
+                <CircleMarker key={id} center={[Number(record.latitude), Number(record.longitude)]} radius={selectedId === id ? 12 : 8} pathOptions={{ color, fillColor: color, fillOpacity: 0.78, weight: selectedId === id ? 3 : 2, dashArray: record.record_origin === "historical_unknown" ? "4 4" : undefined }} eventHandlers={{ click: () => setSelectedId(id) }}>
+                  <Popup>
+                    <div className="popup">
+                      <strong>{id}</strong>
+                      <span>Coordinates: {Number(record.latitude).toFixed(6)}, {Number(record.longitude).toFixed(6)}</span>
+                      <span>Confidence: {formatPercent(record.last_detection_confidence ?? record.confidence_percent)}</span>
+                      <span>Detected: {formatDate(record.last_seen_at || record.created_at || record.first_detected_at)}</span>
+                      <span>Origin: {record.record_origin === "historical_unknown" ? "Historical / unknown" : record.source || "Source recorded"}</span>
+                      <span>GPS accuracy: {record.gps_accuracy_m == null ? "Unavailable" : `${Number(record.gps_accuracy_m).toFixed(1)} m`}</span>
+                      <span>Verification: {record.verification_status?.replaceAll("_", " ") || "Unknown"}</span>
+                      <span>Location verification: {record.location_verification_status || "UNVERIFIED"} · {record.location_verification_method || "Unavailable"}</span>
+                      <span>Severity: {record.severity}</span>
+                      <a href={`https://www.google.com/maps?q=${record.latitude},${record.longitude}`} target="_blank" rel="noreferrer">Open coordinates</a>
+                    </div>
+                  </Popup>
+                </CircleMarker>
+              );
+            })}
+          </MapContainer>
+          {tileStatus === "loading" && <div className="map-overlay">Loading OpenStreetMap tiles...</div>}
+          {tileStatus === "error" && <div className="map-error" role="alert">Some map tiles could not be loaded. Check your network connection; markers remain based on stored records.</div>}
+          <div className="map-legend">
+            <span><i className="historical" />Historical / unknown</span>
+            <span><i className="unverified" />Source recorded; awaiting verification</span>
+            <span><i className="verified" />Verified</span>
+          </div>
+        </div>
+      ) : (
+        <EmptyState icon={MapPin} title="No verified GPS markers" body={coordinateRecords.length ? `Locations without accuracy at or below ${accuracyThreshold} m (or manual verification) are excluded.` : "Locations meeting the configured GPS verification rules will appear here."} />
+      )}
+      <UnverifiedLocationList records={unverifiedRecords} events={events} onVerify={setSelected} />
+      {selected && <LocationVerificationDialog event={selected} onClose={() => setSelected(null)} onVerified={() => { setSelected(null); refresh({ silent: true, forceMap: true }); }} />}
+    </div>
+  );
+}
+
+function MapSelection({ point, setPoint }) {
+  useMapEvents({ click(event) { setPoint({ latitude: event.latlng.lat, longitude: event.latlng.lng }); } });
+  return point ? <Marker position={[point.latitude, point.longitude]} /> : null;
+}
+
+function LocationVerificationDialog({ event, onClose, onVerified }) {
+  const [point, setPoint] = useState(null);
+  const [adminId, setAdminId] = useState("");
+  const [adminKey, setAdminKey] = useState("");
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const image = event.annotated_image_reference || event.image_reference;
+  async function confirm() {
+    if (!point) { setError("Click the map to place the pothole marker before confirming."); return; }
+    setSaving(true); setError("");
+    try {
+      const response = await apiFetch(`${API_BASE}/api/detections/${encodeURIComponent(event.event_id)}/verify-location`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...(adminKey ? { "X-Roadwatch-Admin-Key": adminKey } : {}) },
+        body: JSON.stringify({ ...point, administrator_id: adminId || null }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          getApiErrorMessage(payload, response.status, "Verification failed.")
+        );
+      }
+      onVerified();
+    } catch (failure) { setError(failure.message || "Could not save the verified location."); }
+    finally { setSaving(false); }
+  }
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><section className="location-dialog" role="dialog" aria-modal="true" aria-labelledby="verify-title">
+    <div className="dialog-heading"><div><h3 id="verify-title">Verify Location · {event.display_id || event.event_id}</h3><p>Click the pothole’s location on the map, then confirm.</p></div><button className="secondary" onClick={onClose}>Close</button></div>
+    <div className="verification-review">{image && <img src={`${API_BASE}${image}`} alt="Uploaded road image with YOLO detection overlay" />}<div><strong>YOLO confidence: {formatConfidence(event.confidence_percent)}</strong><span>Detection time: {formatDate(event.timestamp)}</span><span>Source: {event.source_id || "image_upload"}</span><span>YOLO confidence describes detection certainty; it is separate from GPS precision.</span></div></div>
+    <div className="verification-map"><MapContainer center={[Number(event.latitude) || 20.5937, Number(event.longitude) || 78.9629]} zoom={event.latitude != null ? 15 : 5} scrollWheelZoom className="leaflet-map"><TileLayer attribution='&copy; OpenStreetMap contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" /><MapSelection point={point} setPoint={setPoint} /></MapContainer></div>
+    {point && <div className="detail-strip">Selected: {point.latitude.toFixed(6)}, {point.longitude.toFixed(6)}</div>}
+    <div className="gps-input-grid"><label>Administrator identifier (optional)<input value={adminId} onChange={(e) => setAdminId(e.target.value)} placeholder="Name or staff ID" /></label><label>Admin API key (when configured)<input type="password" value={adminKey} onChange={(e) => setAdminKey(e.target.value)} autoComplete="off" /></label></div>
+    {error && <div className="alert" role="alert">{error}</div>}<div className="button-row"><button onClick={confirm} disabled={saving || !point}>{saving ? "Saving…" : "Confirm location"}</button></div>
+  </section></div>;
+}
+
+function RegistryTable({ records, total, page, setPage, pageSize, selectedId, setSelectedId, isAdmin = false }) {
+  if (!records.length) return <EmptyState icon={ClipboardList} title="No pothole records available" body="Try changing the filters, or check back after detections are saved." />;
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  return (
+    <>
+      <DataTable>
+          <thead><tr><th>Pothole ID</th><th>Image</th>{isAdmin && <th>Reported by</th>}<th>Detected</th><th>Severity</th><th>Confidence</th><th>Latitude</th><th>Longitude</th><th>GPS accuracy</th><th>Location status</th><th>Location</th></tr></thead>
+          <tbody>
+            {records.map((record) => {
+              const id = record.pothole_id ?? record._id;
+              const key = recordKey(record);
+              return (
+                <tr key={key} className={selectedId === key ? "selected" : ""} onClick={() => setSelectedId(key)}>
+                  <td><strong>{id}</strong></td>
+                  <td>{(record.annotated_image_reference || record.image_reference) ? <img className="record-thumbnail" src={`${API_BASE}${record.annotated_image_reference || record.image_reference}`} alt={`Pothole ${id}`} loading="lazy" /> : "—"}</td>
+                  {isAdmin && <td>{record.reported_by_name || "Legacy / unassigned"}</td>}
+                  <td>{formatDate(record.last_seen_at || record.created_at || record.first_detected_at)}</td>
+                  <td>{record.severity_recorded === false ? <StatusBadge value="Not recorded" /> : <StatusBadge value={record.severity || "Unavailable"} />}</td>
+                  <td>{formatPercent(record.confidence_percent)}</td>
+                  <td>{record.latitude ?? "—"}</td><td>{record.longitude ?? "—"}</td>
+                  <td>{record.gps_accuracy_m == null ? "Unavailable" : `${Number(record.gps_accuracy_m).toFixed(1)} m`}</td>
+                  <td><StatusBadge value={record.location_verification_status || "UNVERIFIED"} /></td>
+                  <td>{locationLabel(record)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+      </DataTable>
+      <div className="pagination">
+        <button disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>Previous</button>
+        <span>Page {page} of {pages}</span>
+        <button disabled={page >= pages} onClick={() => setPage((p) => p + 1)}>Next</button>
+      </div>
+    </>
+  );
+}
+
+function SeverityAnalysis({ records, total, distribution, trends, page, setPage, pageSize, selectedId, setSelectedId }) {
+  return <><section className="metrics-grid overview-metrics">{["high", "medium", "low"].map((key) => <MetricCard key={key} title={`${key[0].toUpperCase()}${key.slice(1)} severity`} value={distribution[key] || 0} detail="Recorded severity only" icon={AlertTriangle} tone={key === "high" ? "red" : key === "medium" ? "amber" : "green"} />)}</section><div className="dashboard-grid"><Panel title="Severity distribution"><DistributionChart distribution={distribution} /></Panel><Panel title="Severity comparison"><DistributionBar distribution={Object.fromEntries(["high", "medium", "low"].map(k => [k, distribution[k] || 0]))} /></Panel><Panel title="Severity trends"><SeverityTrendChart trends={trends} /></Panel><Panel title="Severity records"><RegistryTable records={records} total={total} page={page} setPage={setPage} pageSize={pageSize} selectedId={selectedId} setSelectedId={setSelectedId} /></Panel></div></>;
+}
+
+function SeverityTrendChart({ trends }) {
+  if (!trends.length) return <EmptyState icon={BarChart3} title="No severity trend data" body="Timestamped records will appear here." />;
+  return <ResponsiveContainer width="100%" height={260}><AreaChart data={trends} margin={{ bottom: 16 }}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="date" label={{ value: "Date", position: "insideBottom", offset: -8 }} /><YAxis allowDecimals={false} label={{ value: "Potholes", angle: -90, position: "insideLeft" }} /><Tooltip /><Legend /><Area type="monotone" dataKey="high" name="High" stroke={SEVERITY_COLORS.high} fill="#fee2e2" /><Area type="monotone" dataKey="medium" name="Medium" stroke={SEVERITY_COLORS.medium} fill="#fef3c7" /><Area type="monotone" dataKey="low" name="Low" stroke={SEVERITY_COLORS.low} fill="#dcfce7" /></AreaChart></ResponsiveContainer>;
+}
+
+function DetectionEventTable({ events, total, isAdmin = false }) {
+  if (!events.length) {
+    return <EmptyState icon={Activity} title="No saved detection events" body="Events appear here after the backend confirms saving YOLO observations. Historical pothole records are not shown as new events." />;
+  }
+  return (
+    <>
+      <DataTable>
+          <thead><tr><th>Detection ID</th>{isAdmin && <th>Reported by</th>}<th>Source</th><th>Timestamp</th><th>Confidence</th><th>Coordinates</th><th>GPS accuracy</th><th>Location status</th><th>Linked pothole</th></tr></thead>
+          <tbody>
+            {events.map((event) => (
+              <tr key={event.event_id || event._id}>
+                <td><strong>Detection #{event.display_id ?? "—"}</strong></td>
+                {isAdmin && <td>{event.reported_by_name || "Legacy / unassigned"}</td>}
+                <td>{event.source_id || "Source unavailable"}</td>
+                <td>{formatDate(event.timestamp)}</td>
+                <td>{formatConfidence(event.confidence_percent ?? event.confidence_normalized)}</td>
+                <td>{validCoordinate(event) ? `${Number(event.latitude).toFixed(5)}, ${Number(event.longitude).toFixed(5)}` : "Unavailable"}</td>
+                <td>{event.gps_accuracy_m == null ? "Unavailable" : `${Number(event.gps_accuracy_m).toFixed(1)} m`}</td>
+                <td>{event.location_verification_status || "UNVERIFIED"}{event.location_verification_reason ? ` · ${event.location_verification_reason}` : ""}</td>
+                <td>{event.pothole_id ?? "Event only"}</td>
+              </tr>
+            ))}
+          </tbody>
+      </DataTable>
+      <div className="detail-strip">Showing {events.length} of {total} saved detection events. Events without coordinates are kept separate from mapped pothole records.</div>
+    </>
+  );
+}
+
+function Overview({ data, selectedId, setSelectedId, adminStats, isAdmin }) {
+  const summary = data.summary || {};
+  const severity = Object.keys(summary.detection_event_severity_distribution || {}).length
+    ? summary.detection_event_severity_distribution
+    : summary.severity_distribution || {};
+  return (
+    <>
+      <section className="metrics-grid overview-metrics">
+        <MetricCard title="Total potholes" value={summary.total_pothole_records ?? 0} detail="Stored MongoDB records" icon={ClipboardList} tone="blue" />
+        {adminStats && <MetricCard title="Registered users" value={adminStats.total_users ?? 0} detail="MongoDB user accounts" icon={Users} tone="blue" />}
+        <MetricCard title="Detection records" value={summary.total_detection_events ?? 0} detail="Saved detection events" icon={Activity} tone="blue" />
+        <MetricCard title="High severity" value={(severity.high || 0) + (severity.critical || 0)} detail="High and critical records" icon={AlertTriangle} tone="red" />
+        <MetricCard title="Medium severity" value={severity.medium || 0} detail="Stored severity records" icon={Activity} tone="amber" />
+        <MetricCard title="Low severity" value={severity.low || 0} detail="Stored severity records" icon={Activity} tone="green" />
+        <MetricCard title="Verified locations" value={summary.verified_locations ?? 0} detail="GPS verified or manually verified" icon={ShieldCheck} tone="green" />
+        <MetricCard title="Unverified locations" value={summary.unverified_locations ?? 0} detail="Detection events needing location review" icon={MapPin} tone="amber" />
+      </section>
+      <section className="dashboard-grid overview-dashboard-grid">
+        <Panel title="GIS Overview" subtitle={`${data.mapCount} verified locations${data.mapTruncated ? " (map limit reached)" : ""}`}><PotholeMap records={data.mapRecords} unverifiedRecords={data.potholes} events={data.detectionEvents} selectedId={selectedId} setSelectedId={setSelectedId} refresh={data.refresh} accuracyThreshold={summary.gps_accuracy_threshold_m ?? 100} /></Panel>
+        <Panel title="Detection Trends" subtitle="Based only on timestamped detection events"><TrendChart trends={data.trends} /></Panel>
+        <Panel title="Latest Saved Detection Events" subtitle={`${data.detectionEventTotal} backend-confirmed events; separate from historical pothole records`}><DetectionEventTable events={data.detectionEvents.slice(0, 6)} total={data.detectionEventTotal} isAdmin={isAdmin} /></Panel>
+        <Panel title={isAdmin ? "Global pothole records" : "My recent potholes"}><RegistryTable records={data.potholes.slice(0, 6)} total={data.total} page={1} setPage={() => {}} pageSize={6} selectedId={selectedId} setSelectedId={setSelectedId} isAdmin={isAdmin} /></Panel>
+      </section>
+    </>
+  );
+}
+
+function DistributionChart({ distribution = {} }) {
+  const data = Object.entries(distribution).map(([name, value]) => ({ name, value }));
+  if (!data.length) return <EmptyState icon={BarChart3} title="No severity data" body="Severity distribution appears after records are available." />;
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <PieChart><Pie data={data} dataKey="value" nameKey="name" outerRadius={88} label>{data.map((entry) => <Cell key={entry.name} fill={SEVERITY_COLORS[entry.name] || "#2563eb"} />)}</Pie><Tooltip /><Legend /></PieChart>
+    </ResponsiveContainer>
+  );
+}
+
+function TrendChart({ trends = [] }) {
+  if (!trends.length) return <EmptyState icon={BarChart3} title="No trend data" body="Time series analytics will update from database timestamps." />;
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <AreaChart data={trends} margin={{ bottom: 16 }}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="date" label={{ value: "Date", position: "insideBottom", offset: -8 }} /><YAxis allowDecimals={false} label={{ value: "Detections", angle: -90, position: "insideLeft" }} /><Tooltip /><Legend /><Area type="monotone" dataKey="observations" name="Detection events" stroke="#0f766e" fill="#ccfbf1" /><Area type="monotone" dataKey="unique_potholes" name="Linked potholes" stroke="#2563eb" fill="#dbeafe" /></AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+function LiveDetection({ camera, setCamera, refresh }) {
+  const [recordId, setRecordId] = useState("");
+  const [lookup, setLookup] = useState({ loading: false, error: "", record: null });
+  const [files, setFiles] = useState([]);
+  const [latitude, setLatitude] = useState("");
+  const [longitude, setLongitude] = useState("");
+  const [gpsAccuracy, setGpsAccuracy] = useState("");
+  const [analysis, setAnalysis] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [batchSummary, setBatchSummary] = useState("");
+  const [deviceLocation, setDeviceLocation] = useState(false);
+  const [locationMessage, setLocationMessage] = useState("");
+  const [streamError, setStreamError] = useState("");
+  const lastSavedRefreshRef = useRef("");
+  const streamRetryTimerRef = useRef(null);
+
+  useEffect(() => () => window.clearTimeout(streamRetryTimerRef.current), []);
+
+  function handleStreamLoad() {
+    window.clearTimeout(streamRetryTimerRef.current);
+    streamRetryTimerRef.current = null;
+    setStreamError("");
+  }
+
+  function handleStreamError() {
+    setStreamError("The live camera stream stopped or could not be reached. Reconnecting…");
+    window.clearTimeout(streamRetryTimerRef.current);
+    streamRetryTimerRef.current = window.setTimeout(() => {
+      setCamera((current) => current.running
+        ? { ...current, streamKey: current.streamKey + 1 }
+        : current);
+    }, 1500);
+  }
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    apiFetch(`${API_BASE}/api/camera/status`, { signal: controller.signal })
+      .then(async (response) => {
+        const status = await response.json();
+        if (!response.ok) {
+          throw new Error(getApiErrorMessage(status, response.status, "Camera status request failed."));
+        }
+        if (!active) return;
+        setCamera((current) => ({
+          ...current,
+          running: Boolean(status.camera?.running),
+          status,
+          error: status.camera?.running
+            ? status.camera?.error || status.yolo_inference?.error || ""
+            : "",
+        }));
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError" && active) {
+          setCamera((current) => ({ ...current, error: error.message || "Could not read camera status." }));
+        }
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [setCamera]);
+
+  useEffect(() => {
+    if (!camera.running) return undefined;
+    const controller = new AbortController();
+    let active = true;
+    const pollCameraStatus = async () => {
+      try {
+        const response = await apiFetch(`${API_BASE}/api/camera/status`, {
+          signal: controller.signal,
+        });
+        const status = await response.json();
+        if (!response.ok) {
+          throw new Error(getApiErrorMessage(status, response.status, "Camera status request failed."));
+        }
+        if (!active) return;
+        setCamera((current) => ({
+          ...current,
+          running: Boolean(status.camera?.running),
+          status,
+          error: status.camera?.running
+            ? status.camera?.error || status.yolo_inference?.error || ""
+            : "",
+        }));
+        const savedAt = status.detection?.saved_at;
+        if (savedAt && savedAt !== lastSavedRefreshRef.current) {
+          lastSavedRefreshRef.current = savedAt;
+          refresh({ silent: true, forceMap: true });
+        }
+      } catch (error) {
+        if (error.name !== "AbortError" && active) {
+          setCamera((current) => ({ ...current, error: error.message || "Could not read camera status." }));
+        }
+      }
+    };
+    pollCameraStatus();
+    const interval = window.setInterval(pollCameraStatus, 1000);
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [camera.running, refresh, setCamera]);
+
+  function selectImage(event) {
+    const selectedFiles = Array.from(event.target.files || []);
+    setFiles(selectedFiles);
+    setAnalysis(null);
+    setUploadError("");
+    setBatchSummary("");
+  }
+
+  async function analyzeImage(event) {
+    event.preventDefault();
+    if (!files.length) return;
+    setUploading(true);
+    setAnalysis(null);
+    setUploadError("");
+    setBatchSummary("");
+    try {
+      const results = [];
+      const failures = [];
+      for (const imageFile of files) {
+        const form = new FormData();
+        form.append("file", imageFile);
+        if (latitude.trim()) form.append("latitude", latitude.trim());
+        if (longitude.trim()) form.append("longitude", longitude.trim());
+        if (gpsAccuracy.trim()) form.append("gps_accuracy_m", gpsAccuracy.trim());
+        if (deviceLocation) form.append("device_location", "true");
+        try {
+          const response = await apiFetch(`${API_BASE}/api/detections/image`, { method: "POST", body: form });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(
+              getApiErrorMessage(payload, response.status, "Image inference failed.")
+            );
+          }
+          results.push(payload);
+        } catch (failure) {
+          failures.push(`${imageFile.name}: ${failure.message || "Upload failed."}`);
+        }
+      }
+      if (!results.length) {
+        throw new Error(failures.join("; ") || "No images could be analyzed.");
+      }
+      const saved = results.reduce((sum, item) => sum + (item.saved_detection_events || 0), 0);
+      const saveFailures = results.reduce((sum, item) => sum + (item.save_failures || 0), 0);
+      setAnalysis(results[results.length - 1]);
+      setBatchSummary(
+        `Processed ${results.length} of ${files.length} selected images; ` +
+        `${saved} detection events saved` +
+        (saveFailures ? `, ${saveFailures} saves unconfirmed` : "") +
+        (failures.length ? `. Failed uploads: ${failures.join("; ")}` : ".")
+      );
+      if (saved > 0 || saveFailures > 0) {
+        refresh({ silent: true, forceMap: true });
+      }
+    } catch (error) {
+      setUploadError(error.message || "Image inference failed.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function controlCamera(action) {
+    setCamera((c) => ({ ...c, loading: true, error: "" }));
+    try {
+      const response = await apiFetch(`${API_BASE}/api/camera/${action}`, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok || payload.status === "error") {
+        throw new Error(getApiErrorMessage(payload, response.status, "Camera command failed."));
+      }
+      setStreamError("");
+      setCamera((c) => ({
+        ...c,
+        running: action === "start" || payload.status === "stopping",
+        loading: false,
+        error: "",
+        streamKey: action === "start" ? c.streamKey + 1 : c.streamKey,
+      }));
+    } catch (error) {
+      setCamera((c) => ({ ...c, loading: false, running: false, error: error.message }));
+    }
+  }
+  const detection = camera.status?.detection || {};
+  const gps = camera.status?.gps || {};
+  const inferenceStatus = camera.status?.yolo_inference || {};
+  const roadScene = camera.status?.road_scene || {};
+  const gpsStatus = {
+    ready_to_save_without_gps: "Detection found; it will be saved as an event without a mapped location because GPS is unavailable.",
+    gps_accuracy_unavailable: "Detection found; it will be saved, but location accuracy is unavailable.",
+    ready_to_save_low_accuracy: "Detection found; it will be saved, but GPS accuracy is over 100 m and will not be shown as a precise map marker.",
+    cooldown: "Detection found; waiting for the save cooldown.",
+    already_saved_for_current_detection: "This continuous detection has already been submitted; waiting until it leaves view before submitting another.",
+    awaiting_backend_confirmation: "Detection submitted once; waiting for backend confirmation.",
+    ready_to_save: "Detection found; waiting for backend confirmation.",
+    partially_saved: "Some detections were saved; at least one save was not confirmed. See the backend error below.",
+    save_failed: detection.save_error || "Detection found, but the backend did not confirm saving it. It will not be resubmitted until the detection clears.",
+  }[detection.save_status];
+  const gpsStatusLabel = {
+    connected: "Available",
+    low_accuracy: "Low accuracy",
+    acquiring: "Acquiring location",
+    permission_error: "Permission error",
+    disconnected: "Unavailable",
+    unavailable: "Unavailable",
+    unknown: "Unavailable / not yet checked",
+  }[gps.status] || "Unavailable / not yet checked";
+  async function searchRecord(event) {
+    event.preventDefault();
+    if (!recordId.trim()) return;
+    setLookup({ loading: true, error: "", record: null });
+    try {
+      const raw = recordId.trim();
+      const detectionNumber = raw.match(/^(?:detection\s*#\s*|#)?(\d+)$/i)?.[1];
+      const paths = detectionNumber
+        ? [`/api/detections/${detectionNumber}`, `/api/potholes/${encodeURIComponent(raw)}`, `/api/detections/${encodeURIComponent(raw)}`]
+        : [`/api/potholes/${encodeURIComponent(raw)}`, `/api/detections/${encodeURIComponent(raw)}`];
+      for (const path of paths) {
+        const response = await apiFetch(`${API_BASE}${path}`);
+        const payload = await response.json();
+        if (response.status === 404) continue;
+        if (!response.ok) {
+          throw new Error(
+            getApiErrorMessage(payload, response.status, "Record lookup failed.")
+          );
+        }
+        setLookup({ loading: false, error: "", record: payload.pothole || payload.detection });
+        return;
+      }
+      setLookup({ loading: false, error: "No detection record found.", record: null });
+    } catch (error) { setLookup({ loading: false, error: error.message || "Could not retrieve this record.", record: null }); }
+  }
+  return (
+    <><Panel title="Find a stored record" subtitle="Search by pothole ID or simple detection number"><form className="filters" onSubmit={searchRecord}><label className="search"><Search size={16} /><input value={recordId} onChange={(e) => setRecordId(e.target.value)} placeholder="Pothole ID or Detection #" /></label><button type="submit" disabled={lookup.loading}>{lookup.loading ? "Searching…" : "Search"}</button></form>{lookup.error && <div className="detail-strip">{lookup.error}</div>}{lookup.record && <div className="lookup-card">{lookup.record.image_url || lookup.record.annotated_image_reference ? <img src={lookup.record.image_url || lookup.record.annotated_image_reference} alt="Stored pothole detection" /> : null}<div><strong>{lookup.record.event_id ? `Detection #${lookup.record.display_id}` : lookup.record.pothole_id ?? lookup.record._id}</strong><span>Severity: {lookup.record.severity_recorded === false ? "Not recorded" : lookup.record.severity ?? lookup.record.severity_estimate ?? "Unavailable"}</span><span>Confidence: {formatPercent(lookup.record.confidence_percent)}</span><span>GPS: {lookup.record.latitude ?? "—"}, {lookup.record.longitude ?? "—"}</span><span>Detected: {formatDate(lookup.record.last_seen_at || lookup.record.timestamp || lookup.record.created_at || lookup.record.first_detected_at)}</span></div></div>}</Panel><div className="two-column">
+      <Panel title="Live Camera Detection" subtitle={`YOLO model: ${inferenceStatus.model_file_exists ? "available" : "not found"} at runs/pothole_yolo11n/weights/best.pt`}>
+        <div className="camera-stage">
+          {camera.running ? <img key={camera.streamKey} src={`${API_BASE}/api/camera/stream?session=${camera.streamKey}`} alt="Live YOLO annotated camera feed" onLoad={handleStreamLoad} onError={handleStreamError} /> : <div><Camera size={46} /><strong>Camera is not streaming</strong><span>Start the local camera agent to see real annotated frames.</span></div>}
+        </div>
+        {roadScene.status === "not_road" && <div className="alert"><AlertTriangle size={17} />{"Invalid Image! Please upload a valid road image containing a road scene."}</div>}
+        {roadScene.status === "unavailable" && <div className="alert"><AlertTriangle size={17} />Road-scene validation is unavailable. Detection is paused until validation recovers.</div>}
+        {(camera.error || streamError || detection.save_error || inferenceStatus.error || gps.error) && <div className="alert"><AlertTriangle size={17} />{camera.error || streamError || detection.save_error || inferenceStatus.error || gps.error}</div>}
+        <div className="live-metrics">
+          <article><span>Detections in latest frame</span><strong>{detection.count ?? 0}</strong></article>
+          <article><span>Backend-confirmed events in latest episode</span><strong>{detection.saved_count ?? 0}</strong></article>
+          <article><span>Latest confidence</span><strong>{detection.confidence == null ? "N/A" : `${(detection.confidence * 100).toFixed(2)}%`}</strong></article>
+          <article><span>Latest detection</span><strong>{formatDate(detection.detected_at)}</strong></article>
+          <article><span>Backend-confirmed save</span><strong>{formatDate(detection.saved_at)}</strong></article>
+          <article><span>GPS coordinates</span><strong>{gps.latitude == null || gps.longitude == null ? "Unavailable" : `${Number(gps.latitude).toFixed(6)}, ${Number(gps.longitude).toFixed(6)}`}</strong></article>
+          <article><span>GPS accuracy</span><strong>{gps.accuracy_m == null ? "Unavailable" : `${Number(gps.accuracy_m).toFixed(1)} m`}</strong></article>
+        </div>
+        <div className={`detail-strip gps-status ${gps.status === "low_accuracy" || gps.status === "permission_error" ? "warning" : ""}`}>
+          GPS status: {gpsStatusLabel}
+          {gps.accuracy_m == null ? "" : ` · Reported accuracy ${Number(gps.accuracy_m).toFixed(1)} m`}
+          {gps.last_updated_at ? ` · Updated ${formatDate(gps.last_updated_at)}` : ""}
+          {gpsStatus ? ` · ${gpsStatus}` : ""}
+        </div>
+        <div className="button-row"><button onClick={() => controlCamera("start")} disabled={camera.running || camera.loading}><Camera size={16} />{camera.loading ? "Starting..." : "Start Camera"}</button><button className="secondary" onClick={() => controlCamera("stop")} disabled={!camera.running || camera.loading}><X size={16} />{camera.loading ? "Stopping..." : "Stop Camera"}</button></div>
+      </Panel>
+      <Panel title="Image Upload Detection" subtitle="Runs the existing trained YOLO model on this uploaded image">
+        <form className="image-upload-form" onSubmit={analyzeImage}>
+          <label className="file-picker"><Upload size={22} /><span>{files.length ? `${files.length} image${files.length === 1 ? "" : "s"} selected` : "Choose one or more JPEG, PNG, WebP, or BMP images (max 10 MB each)"}</span><input type="file" accept="image/jpeg,image/png,image/webp,image/bmp" multiple onChange={selectImage} /></label>
+          <div className="gps-input-grid">
+            <label>Latitude (optional)<input type="number" min="-90" max="90" step="any" value={latitude} onChange={(event) => setLatitude(event.target.value)} placeholder="e.g. 16.02" /></label>
+            <label>Longitude (optional)<input type="number" min="-180" max="180" step="any" value={longitude} onChange={(event) => setLongitude(event.target.value)} placeholder="e.g. 74.69" /></label>
+            <label>GPS accuracy in metres (optional)<input type="number" min="0" step="any" value={gpsAccuracy} onChange={(event) => setGpsAccuracy(event.target.value)} placeholder="Leave blank if unknown" /></label>
+          </div>
+          <button className="secondary" type="button" onClick={() => {
+            setLocationMessage("");
+            if (!navigator.geolocation) { setLocationMessage("Browser geolocation is unavailable."); return; }
+            navigator.geolocation.getCurrentPosition((position) => {
+              setLatitude(String(position.coords.latitude)); setLongitude(String(position.coords.longitude)); setGpsAccuracy(String(position.coords.accuracy)); setDeviceLocation(true);
+              setLocationMessage("Upload-time device location captured with your permission. This may differ from where the image was taken.");
+            }, (failure) => {
+              setDeviceLocation(false);
+              setLatitude(""); setLongitude(""); setGpsAccuracy("");
+              setLocationMessage(failure.code === failure.PERMISSION_DENIED ? "Location permission was denied. You can still upload the image without GPS." : failure.code === failure.TIMEOUT ? "Location request timed out. You can retry or upload without GPS." : "Could not obtain device location. You can still upload without GPS.");
+            }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 });
+          }}><MapPin size={16} />Use current device location</button>
+          {locationMessage && <div className="detail-strip" role="status">{locationMessage}</div>}
+          <button type="submit" disabled={!files.length || uploading}>{uploading ? <Loader2 className="spin" size={16} /> : <Activity size={16} />}{uploading ? `Analyzing ${files.length} image${files.length === 1 ? "" : "s"}...` : "Run pothole detection"}</button>
+        </form>
+        <div className="explain">Images are checked for EXIF GPS and capture time. If no GPS is embedded, you may explicitly request your current device location; this is the upload-time location, not necessarily where the image was captured. Missing or imprecise GPS never prevents a pothole detection from being saved.</div>
+        {uploadError && <div className="alert"><AlertTriangle size={17} />{uploadError}</div>}
+        {analysis && <div className="upload-result">
+          {batchSummary && <div className="detail-strip">{batchSummary}. The preview below shows the last successfully processed image.</div>}
+          <div className="upload-result-heading"><strong>{analysis.detection_count} pothole detection{analysis.detection_count === 1 ? "" : "s"}</strong><span>{analysis.filename}</span></div>
+          <img className="annotated-upload" src={`data:image/jpeg;base64,${analysis.annotated_image_base64}`} alt={`YOLO annotated result for ${analysis.filename}`} />
+          {analysis.detections.length > 0 ? <ul className="upload-detections">{analysis.detections.map((detection, index) => <li key={`${detection.class_id}-${index}`}><strong>{detection.class_name}</strong><span>Confidence: {detection.confidence_percent}%</span></li>)}</ul> : <div className="detail-strip">YOLO returned zero detections for this image.</div>}
+          <div className="detail-strip">{analysis.persistence_note}{analysis.saved_detection_events > 0 && ` Backend-confirmed saved events: ${analysis.saved_detection_events}.`}</div>
+          <div className="detail-strip">Location: {analysis.location_verification_status || "UNVERIFIED"}{analysis.location_source ? ` via ${analysis.location_source}` : ""}{analysis.location_verification_reason ? ` · ${analysis.location_verification_reason}` : ""}{analysis.capture_timestamp ? ` · Image captured ${formatDate(analysis.capture_timestamp)}` : ""}</div>
+          {analysis.save_failures > 0 && <div className="alert"><AlertTriangle size={17} />YOLO analysis succeeded, but MongoDB did not confirm {analysis.save_failures} detection save(s). The annotated result is shown above; check backend/database health before retrying.</div>}
+          {analysis.persistence?.length > 0 && <ul className="upload-detections">{analysis.persistence.map((item) => <li key={item.event_id}><strong>{item.error ? "Save not confirmed" : item.message || (item.pothole_id ? `Saved as ${item.pothole_id}` : "Event saved; no mapped record")}</strong><span>{item.error || (item.linked_existing ? "Linked to an existing nearby record." : "Backend confirmed the event.")}</span></li>)}</ul>}
+        </div>}
+      </Panel>
+      <VideoUpload refresh={refresh} latitude={latitude} longitude={longitude} gpsAccuracy={gpsAccuracy} />
+    </div></>
+  );
+}
+
+function VideoUpload({ refresh, latitude, longitude, gpsAccuracy }) {
+  const [file, setFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+  async function submit(event) {
+    event.preventDefault();
+    if (!file) return;
+    setBusy(true);
+    setError("");
+    setResult(null);
+    const form = new FormData();
+    form.append("file", file);
+    if (latitude.trim()) form.append("latitude", latitude.trim());
+    if (longitude.trim()) form.append("longitude", longitude.trim());
+    if (gpsAccuracy.trim()) form.append("gps_accuracy_m", gpsAccuracy.trim());
+    try {
+      const response = await apiFetch(`${API_BASE}/api/detections/video`, { method: "POST", body: form });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(
+          getApiErrorMessage(payload, response.status, "Video detection failed.")
+        );
+      }
+      setResult(payload);
+      if (payload.detection_count) refresh({ silent: true, forceMap: true });
+    } catch (err) {
+      setError(err.message || "Video detection failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <Panel title="Video Detection" subtitle="Validate road scenes, run YOLO on accepted frames, and review the annotated output.">
+      <form className="image-upload-form" onSubmit={submit}>
+        <label className="file-picker">
+          <Upload size={22} />
+          <span>{file?.name || "Choose MP4, MOV, WebM, or AVI (max 50 MB)"}
+            <input
+              type="file"
+              accept="video/mp4,video/quicktime,video/webm,video/x-msvideo,.mp4,.mov,.webm,.avi"
+              onChange={(event) => {
+                setFile(event.target.files?.[0] || null);
+                setResult(null);
+                setError("");
+              }}
+            />
+          </span>
+        </label>
+        <button disabled={!file || busy}>{busy ? "Analyzing video…" : "Analyze video"}</button>
+      </form>
+      {busy && <LoadingState label="Validating frames and generating the annotated video…" />}
+      {error && <div className="alert" role="alert">{error}</div>}
+      {result && (
+        <div className="video-result">
+          {result.annotated_video_url && (
+            <video
+              controls
+              preload="metadata"
+              playsInline
+              crossOrigin="use-credentials"
+              src={`${API_BASE}${result.annotated_video_url}`}
+              aria-label="YOLO pothole detection results in the annotated video"
+            >
+              Your browser does not support MP4 video playback.
+            </video>
+          )}
+          <div className="detail-strip">
+            Processed {result.frames_processed ?? 0} frames ({result.road_frames ?? 0} validated segments); saved {result.detection_count ?? 0} unique detection events.
+          </div>
+          {result.results?.length > 0 ? (
+            <div className="video-detection-results" aria-label="Video detection results">
+              {result.results.map((item, index) => {
+                const event = item.event || item;
+                const confidence = item.confidence ?? event.confidence;
+                const potholeId = item.pothole_id ?? item.pothole?.pothole_id ?? event.pothole_id;
+                return (
+                  <article key={item.event_id || event.event_id || index}>
+                    <strong>Detection {index + 1}{potholeId ? ` · ${potholeId}` : ""}</strong>
+                    <span>Confidence: {formatConfidence(confidence)}</span>
+                    <span>Severity: {item.severity_estimate || item.pothole?.severity || "Unavailable"}</span>
+                    <span>GPS: {event.latitude == null || event.longitude == null ? "Unavailable" : `${Number(event.latitude).toFixed(6)}, ${Number(event.longitude).toFixed(6)}`}</span>
+                  </article>
+                );
+              })}
+            </div>
+          ) : (
+            <EmptyState icon={Activity} title="No potholes detected" body="The validated road frames were processed, but the model found no potholes in this video." />
+          )}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function Reports({ filters }) {
+  const [exportError, setExportError] = useState("");
+  async function downloadCsv() {
+    setExportError("");
+    try {
+      const response = await apiFetch(`${API_BASE}/api/reports/export.csv`);
+      if (!response.ok) throw new Error("Could not export records.");
+      const blob = await response.blob(); const url = URL.createObjectURL(blob);
+      const link = document.createElement("a"); link.href = url; link.download = "roadwatch-potholes.csv"; link.click(); URL.revokeObjectURL(url);
+    } catch (error) { setExportError(error.message); }
+  }
+  return (
+    <Panel title="Reports and Exports" subtitle="Exports respect backend records and never include secrets">
+      <div className="report-grid">
+        <button className="download-card" onClick={downloadCsv}><Download size={22} /><strong>CSV export</strong><span>Download your authorized pothole registry.</span></button>
+        <div className="download-card muted"><FileText size={22} /><strong>Printable report</strong><span>Use browser print for a PDF summary of this dashboard view.</span></div>
+        <div className="download-card muted"><SlidersHorizontal size={22} /><strong>Active filters</strong><span>{Object.entries(filters).map(([k, v]) => `${k}: ${v}`).join(", ")}</span></div>
+      </div>
+      {exportError && <div className="alert">{exportError}</div>}
+    </Panel>
+  );
+}
+
+function UserManagement() {
+  const [users, setUsers] = useState([]);
+  const [totals, setTotals] = useState(null);
+  const [error, setError] = useState("");
+  const [refresh, setRefresh] = useState(0);
+  useEffect(() => {
+    Promise.all([apiFetch(`${API_BASE}/api/admin/users`), apiFetch(`${API_BASE}/api/admin/dashboard`)]).then(async ([u, d]) => {
+      if (!u.ok || !d.ok) throw new Error("Administrator access is required.");
+      const [userData, dashboard] = await Promise.all([u.json(), d.json()]); setUsers(userData.users); setTotals(dashboard);
+    }).catch(e => setError(e.message));
+  }, [refresh]);
+  async function toggle(user) {
+    const action = user.is_active ? "deactivate" : "activate";
+    if (!window.confirm(`Are you sure you want to ${action} ${user.full_name}?`)) return;
+    const response = await apiFetch(`${API_BASE}/api/admin/users/${user.id}/status`, {method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({is_active:!user.is_active})});
+    if (!response.ok) { setError("Could not update this account."); return; }
+    setRefresh(x=>x+1);
+  }
+  return <><div className="metric-grid">{[["Registered users", totals?.total_users],["Active accounts", totals?.active_users],["Pothole records", totals?.total_potholes],["Detection events", totals?.total_detections],["Legacy potholes", totals?.legacy_potholes]].map(([label,value])=><article className="metric-card" key={label}><span>{label}</span><strong>{value ?? "—"}</strong></article>)}</div><Panel title="Registered users" subtitle="Account status changes take effect immediately"><div className="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Joined</th><th>Status</th><th /></tr></thead><tbody>{users.map(user=><tr key={user.id}><td>{user.full_name}</td><td>{user.email}</td><td>{user.role}</td><td>{formatDate(user.created_at)}</td><td>{user.is_active ? "Active" : "Inactive"}</td><td>{user.role !== "admin" && <button className="secondary" onClick={()=>toggle(user)}>{user.is_active ? "Deactivate" : "Activate"}</button>}</td></tr>)}</tbody></table></div>{error && <div className="alert">{error}</div>}</Panel></>;
+}
+
+function UserContributions() {
+  const [accounts, setAccounts] = useState([]);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    apiFetch(`${API_BASE}/api/admin/analytics`).then(async response => {
+      if (!response.ok) throw new Error("Could not load user contributions.");
+      const data = await response.json(); setAccounts(data.user_contributions || []);
+    }).catch(err => setError(err.message));
+  }, []);
+  return <Panel title="User contributions" subtitle="Counts from owned MongoDB pothole and detection records">{error ? <div className="alert">{error}</div> : !accounts.length ? <EmptyState icon={Users} title="No registered users" body="User contribution data will appear after accounts are created." /> : <div className="table-wrap"><table><thead><tr><th>User</th><th>Email</th><th>Reported potholes</th><th>Detections</th></tr></thead><tbody>{accounts.map(account=><tr key={account.user_id}><td>{account.full_name}</td><td>{account.email}</td><td>{account.potholes}</td><td>{account.detections}</td></tr>)}</tbody></table></div>}</Panel>;
+}
+
+function Dashboard({ user, pathname, navigate, onLogout }) {
+  const [filters, setFilters] = useState({ search: "", severity: "all", verification: "all" });
+  const [page, setPage] = useState(1);
+  const [selectedId, setSelectedId] = useState(null);
+  const [camera, setCamera] = useState({ running: false, loading: false, error: "", streamKey: 0, status: null });
+  const [adminStats, setAdminStats] = useState(null);
+  const navigation = user.role === "admin" ? ADMIN_NAVIGATION : USER_NAVIGATION;
+  const activeItem = navigation.find((item) => item[2] === pathname) || navigation[0];
+  const active = activeItem[3];
+  const includesMap = ["Overview Dashboard", "GIS Map"].includes(active);
+  const data = useRoadwatchData(filters, page, includesMap);
+  useEffect(() => {
+    if (user.role !== "admin") return;
+    apiFetch(`${API_BASE}/api/admin/dashboard`).then(async response => {
+      if (response.ok) setAdminStats(await response.json());
+    }).catch(() => {});
+  }, [user.role]);
+
+  function updateFilters(updater) {
+    setFilters(updater);
+    setPage(1);
+  }
+  function setActivePath(path) { navigate(path); }
+
+  const selectedRecord = useMemo(() => data.potholes.find((record) => recordKey(record) === selectedId), [data.potholes, selectedId]);
+  const chartDistribution = data.summary?.severity_distribution || {};
+
+  function renderPage() {
+    if (data.loading) return <LoadingState />;
+    if (active === "Overview Dashboard") return <Overview data={data} selectedId={selectedId} setSelectedId={setSelectedId} adminStats={adminStats} isAdmin={user.role === "admin"} />;
+    if (active === "Live Detection") return <LiveDetection camera={camera} setCamera={setCamera} refresh={data.refresh} />;
+    if (active === "GIS Map") return <Panel title="Interactive GIS Map" subtitle={`${data.mapCount} verified locations${data.mapTruncated ? " (map limit reached)" : ""}`}><PotholeMap records={data.mapRecords} unverifiedRecords={data.potholes} events={data.detectionEvents} selectedId={selectedId} setSelectedId={setSelectedId} refresh={data.refresh} accuracyThreshold={data.summary?.gps_accuracy_threshold_m ?? 100} />{selectedRecord && <div className="detail-strip">Selected {selectedRecord.pothole_id}: GPS accuracy {selectedRecord.gps_accuracy_m == null ? "unavailable" : `${selectedRecord.gps_accuracy_m} m`}.</div>}</Panel>;
+    if (active === "Pothole Registry") return <><Panel title={user.role === "admin" ? "All reported potholes" : "My potholes"}><RegistryTable records={data.potholes} total={data.total} page={page} setPage={setPage} pageSize={PAGE_SIZE} selectedId={selectedId} setSelectedId={setSelectedId} isAdmin={user.role === "admin"} /></Panel><Panel title="Detection Event Registry"><DetectionEventTable events={data.detectionEvents} total={data.detectionEventTotal} isAdmin={user.role === "admin"} /></Panel></>;
+    if (active === "Severity Analysis") return <SeverityAnalysis records={data.potholes} total={data.total} distribution={chartDistribution} trends={data.summary?.severity_trends || []} page={page} setPage={setPage} pageSize={PAGE_SIZE} selectedId={selectedId} setSelectedId={setSelectedId} />;
+    if (active === "Analytics") return <><div className="dashboard-grid"><Panel title="Daily detection trends"><TrendChart trends={data.trends} /></Panel><Panel title="Monthly detection trends"><TrendChart trends={data.monthlyTrends.map(item => ({...item, date:item.month}))} /></Panel><Panel title="Severity distribution"><DistributionChart distribution={chartDistribution} /></Panel><Panel title="Severity trends"><SeverityTrendChart trends={data.summary?.severity_trends || []} /></Panel><Panel title="Potholes by location"><DistributionBar distribution={data.summary?.location_distribution || {}} /></Panel></div>{user.role === "admin" && <UserContributions />}</>;
+    if (active === "Reports and Exports") return <Reports filters={filters} />;
+    if (active === "User Management" && user.role === "admin") return <UserManagement />;
+    return null;
+  }
+
+  return (
+    <AppLayout navigation={navigation} activePath={pathname} pageTitle={active} pageDescription={PAGE_DESCRIPTIONS[active]} user={user} connected={!data.error} lastSync={data.lastSync} refreshing={data.refreshing} onRefresh={data.refresh} onLogout={onLogout} onNavigate={setActivePath}>
+      {data.error && <div className="alert"><AlertTriangle size={18} />{data.error}<button onClick={() => data.refresh()}>Retry</button></div>}
+      {["Overview Dashboard", "GIS Map", "Pothole Registry", "Analytics", "Severity Analysis", "Reports and Exports"].includes(active) && <FilterBar filters={filters} setFilters={updateFilters} />}
+      {renderPage()}
+    </AppLayout>
+  );
+}
+
+function App() {
+  const [user, setUser] = useState(null);
+  const [checking, setChecking] = useState(true);
+  const [pathname, setPathname] = useState(window.location.pathname);
+  const [error, setError] = useState("");
+  function navigate(path, replace = false) {
+    if (replace) window.history.replaceState({}, "", path);
+    else window.history.pushState({}, "", path);
+    setPathname(path);
+  }
+  useEffect(() => {
+    const onPopState = () => setPathname(window.location.pathname);
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+  useEffect(() => {
+    apiFetch(`${API_BASE}/api/auth/me`).then(async response => {
+      if (response.status === 401) return null;
+      if (!response.ok) throw new Error("Could not validate your session.");
+      setUser(await response.json());
+    }).catch(err => { setError(authErrorMessage(err)); }).finally(() => setChecking(false));
+  }, []);
+  async function submit(event) {
+    event.preventDefault(); setError("");
+    const registering = pathname === "/register";
+    const form = new FormData(event.currentTarget);
+    const body = registering ? {full_name: form.get("full_name"), email: form.get("email"), password: form.get("password")} : {email: form.get("email"), password: form.get("password")};
+    if (registering && body.password !== form.get("confirm_password")) { setError("Passwords do not match."); return; }
+    try {
+      if (registering) {
+        const created = await fetch(`${API_BASE}/api/auth/register`, {method:"POST", credentials:"include", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+        const payload = await created.json();
+        if (!created.ok) {
+          throw new Error(getApiErrorMessage(payload, created.status, "Registration failed."));
+        }
+        setError("Account created. Sign in to continue."); navigate("/login"); return;
+      }
+      const response = await fetch(`${API_BASE}/api/auth/login`, {method:"POST", credentials:"include", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(getApiErrorMessage(data, response.status, "Sign in failed."));
+      }
+      setUser(data.user);
+      navigate(data.user.role === "admin" ? "/admin/dashboard" : "/user/dashboard", true);
+    } catch (err) { setError(authErrorMessage(err)); }
+  }
+  function logout() { apiFetch(`${API_BASE}/api/auth/logout`, {method:"POST"}).catch(()=>{}); setUser(null); navigate("/login", true); }
+  if (checking) return <div className="auth-page">Checking your session…</div>;
+  if (user) {
+    if (["/", "/login", "/register"].includes(pathname)) {
+      const home = user.role === "admin" ? "/admin/dashboard" : "/user/dashboard";
+      navigate(home, true);
+      return <div className="auth-page">Opening your dashboard…</div>;
+    }
+    const adminPath = pathname.startsWith("/admin/");
+    const userPath = pathname.startsWith("/user/");
+    if ((user.role === "admin" && userPath) || (user.role !== "admin" && adminPath)) {
+      return <AccessDenied navigate={navigate} destination={user.role === "admin" ? "/admin/dashboard" : "/user/dashboard"} />;
+    }
+    const menu = user.role === "admin" ? ADMIN_NAVIGATION : USER_NAVIGATION;
+    if (!menu.some((item) => item[2] === pathname)) return <AccessDenied navigate={navigate} destination={user.role === "admin" ? "/admin/dashboard" : "/user/dashboard"} />;
+    return <Dashboard user={user} pathname={pathname} navigate={navigate} onLogout={logout} />;
+  }
+  if (pathname !== "/login" && pathname !== "/register") { navigate("/login", true); return <div className="auth-page">Opening sign in…</div>; }
+  return <AuthPage pathname={pathname} error={error} navigate={navigate} onSubmit={submit} onClearError={() => setError("")} />;
+}
+
+function DistributionBar({ distribution }) {
+  const data = Object.entries(distribution).filter(([, value]) => Number(value) > 0).map(([name, value]) => ({ name: name.replaceAll("_", " "), value }));
+  if (!data.length) return <EmptyState icon={BarChart3} title="No distribution data" body="Charts appear after records are available." />;
+  return <ResponsiveContainer width="100%" height={260}><BarChart data={data} margin={{ bottom: 16 }}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="name" interval={0} angle={data.length > 6 ? -25 : 0} textAnchor={data.length > 6 ? "end" : "middle"} height={data.length > 6 ? 64 : 30} label={{ value: "Severity / status / location", position: "insideBottom", offset: -8 }} /><YAxis allowDecimals={false} label={{ value: "Potholes", angle: -90, position: "insideLeft" }} /><Tooltip /><Bar dataKey="value" name="Potholes" fill="#2563eb" radius={[6, 6, 0, 0]} /></BarChart></ResponsiveContainer>;
+}
+
+export default App;

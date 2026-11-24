@@ -1,0 +1,22 @@
+@'
+**/venv/
+**/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+**/.env
+**/.env.*
+!**/.env.example
+**/node_modules/
+.dist/
+dist/
+build/
+runs/
+*.mp4
+*.avi
+.vscode/
+.idea/
+*.log
+*.tmp
+.DS_Store
+'@ | Set-Content -Encoding utf8 .gitignore

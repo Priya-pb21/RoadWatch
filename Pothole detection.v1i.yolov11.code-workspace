@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"name": "Pothole detection.v1i.yolov11",
+			"path": "../../Downloads/Pothole detection.v1i.yolov11"
+		},
+		{
+			"name": "Road_pothole",
+			"path": "."
+		},
+		{
+			"path": "../../Downloads/Pothole detection.v1i.yolov11 (1)"
+		}
+	],
+	"settings": {}
+}

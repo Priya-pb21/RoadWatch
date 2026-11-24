@@ -1,0 +1,12 @@
+.\backend\venv\Scripts\python.exe -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+.\backend\venv\Scripts\python.exe live_pothole_detection.py
+.\backend\venv\Scripts\python.exe detect_video.py
+
+.\backend\venv\Scripts\python.exe yolo_test.py
+
+
+cd C:\Users\priya\Desktop\Road_pothole\frontend
+npm run dev
+
+
+http://127.0.0.1:8000
